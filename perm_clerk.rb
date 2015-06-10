@@ -6,20 +6,23 @@ module PermClerk
   @logger = Logger.new("perm_clerk.log")
   @logger.level = Logger::INFO
 
+  @runStatus = eval(File.open("lastrun", "r")) rescue {}
+  @runFile = File.open("lastrun", "w")
+
   COMMENT_INDENT = "\n::"
   COMMENT_PREFIX = "{{comment|Automated comment}} "
   EDIT_THROTTLE = 3
   SPLIT_KEY = "====[[User:"
-  PERMISSIONS = [
-    "Account creator",
-    "Autopatrolled",
-    "Confirmed",
-    "File mover",
-    "Pending changes reviewer",
-    "Rollback",
-    "Template editor"
-  ]
-  # PERMISSIONS = ["Rollback"]
+  # PERMISSIONS = [
+  #   "Account creator",
+  #   "Autopatrolled",
+  #   "Confirmed",
+  #   "File mover",
+  #   "Pending changes reviewer",
+  #   "Rollback",
+  #   "Template editor"
+  # ]
+  PERMISSIONS = ["Rollback"]
   PERMISSION_KEYS = {
     "Account creator" => "accountcreator",
     "Autopatrolled" => "autopatrolled",
@@ -48,11 +51,15 @@ module PermClerk
         error("Failed to process")
       else
         info("Processing of #{@permission} complete")
+        @runStatus[@permission] = DateTime.now.new_offset(0)
       end
       @logger.info("\n#{'=' * 100}")
       sleep 2
     end
     @logger.info("Task complete\n#{'~' * 100}")
+
+    @runFile.write(@runStatus.inspect)
+    @runFile.close
   end
 
   def self.process(permission)
@@ -62,6 +69,11 @@ module PermClerk
 
     oldWikitext = setPageProps
     return false unless oldWikitext
+
+    if DateTime.parse(@baseTimestamp).new_offset(0) + Rational(1, 24) < DateTime.now.new_offset(0)
+      info("  Page has not been modified in over an hour")
+      return true
+    end
 
     if @config["autoformat"]
       debug("Checking for extraneous headers")
@@ -76,27 +88,43 @@ module PermClerk
       requestChanges = []
 
       if userNameMatch = section.match(/{{(?:template\:)?rfplinks\|1=(.*)}}/i)
-        userName = userNameMatch.captures[0]
+        userName = userNameMatch.captures[0].gsub("_", " ")
 
         info("Checking section for User:#{userName}...")
 
+        archiveRequested = section.include?("{{User:MusikBot.*Archive\s*now}}")
         timestamps = section.scan(/\d\d:\d\d.*\d{4} \(UTC\)/)
+        newestTimestamp = timestamps.min {|a,b| DateTime.parse(b).new_offset(0) <=> DateTime.parse(a).new_offset(0)}
+        resolution = section.match(/#{@config["archive_done"]}/i) ? "done" : section.match(/#{@config["archive_notdone"]}/i) ? "notdone" : false
 
-        if section.match(/{{(?:template\:)?(done|not\s*done|nd|already\s*done)}}/i) || section.match(/::{{comment|Automated comment}}.*MusikBot/)
+        if resolution || section.match(/::{{comment|Automated comment}}.*MusikBot/)
           info("  #{userName}'s request already responded to or MusikBot has already commented")
-          newWikitext << SPLIT_KEY + section
-        elsif timestamps[0] && DateTime.now + Rational(20, 1440) > DateTime.parse(timestamps[0])
-          info("  #{userName}'s request is over 20 minutes old")
-          newWikitext << SPLIT_KEY + section
+        elsif timestamps[0] && DateTime.parse(timestamps[0]).new_offset(0) + Rational(30, 1440) < DateTime.now.new_offset(0)
+          info("  #{userName}'s request is over 30 minutes old")
+
+          # ARCHIVING
+          if @config["archive"]
+            if DateTime.parse(newestTimestamp).new_offset(0) < DateTime.now.new_offset(0) - Rational(@config["archive_offset"].to_i, 24) && @runStatus[]
+              info("  Request eligible for archiving")
+              userInfo = getUserInfo(userName)
+
+              if section.match(/#{@config["archive_done"]}|#{@config["archive_notdone"]}/i)
+                !userInfo[:userGroups].include?(PERMISSION_KEYS[@permission])
+                info("  User group does not match request response")
+              else
+                # archive request
+                puts "archive #{userName}"
+              end
+            end
+          end
         else
-          alreadyResponded = false
+          haveResponded = false
 
           # AUTORESPOND
-          if @config["autorespond"]
+          if @config["autorespond"] &&
             debug("  Checking if #{userName} already has permission #{@permission}...")
 
-            userInfo = getUserInfo(userName)
-            if userInfo
+            if userInfo = getUserInfo(userName)
               if userInfo[:userGroups].include?(PERMISSION_KEYS[@permission])
                 info("    Found matching user group")
                 requestChanges << {
@@ -104,7 +132,7 @@ module PermClerk
                   permission: @permission.downcase,
                   resolution: "{{already done}}"
                 }
-                alreadyResponded = true
+                haveResponded = true
               end
             end
           end
@@ -152,7 +180,7 @@ module PermClerk
             end
           end
 
-          if !alreadyResponded && @permission != "Confirmed"
+          if !haveResponded && @permission != "Confirmed"
             # CHECK PREREQUISTES
             if @config["prerequisites"]
               debug("  Checking if #{userName} meets configured prerequisites...")
@@ -203,15 +231,15 @@ module PermClerk
               end
             end
           end
+        end
 
-          if requestChanges.length > 0
-            info("***** Commentable data found for #{userName} *****")
-            @usersCount += 1
-            newWikitext << SPLIT_KEY + section.gsub(/\n+$/,"") + messageCompiler(requestChanges)
-          else
-            info("  No commentable data or extraneous headers found for #{userName}")
-            newWikitext << SPLIT_KEY + section
-          end
+        if requestChanges.length > 0
+          info("***** Commentable data found for #{userName} *****")
+          @usersCount += 1
+          newWikitext << SPLIT_KEY + section.gsub(/\n+$/,"") + messageCompiler(requestChanges)
+        else
+          info("  No commentable data found for #{userName}")
+          newWikitext << SPLIT_KEY + section
         end
       else
         newWikitext << SPLIT_KEY + section
@@ -223,7 +251,7 @@ module PermClerk
 
   def self.editPage(newWikitext)
     unless @usersCount > 0 || headersRemoved?
-      info("No commentable data or extraneous headers found for any of the current requests")
+      info("No commentable data found for any of the current requests")
       return true
     end
 
@@ -354,10 +382,10 @@ module PermClerk
         "already has the \"#{params[:permission]}\" user right"
       when :editCount
         "has #{params[:editCount]} total edits"
-      when :mainspaceCount
-        "has #{params[:mainspaceCount].to_i == 0 ? 'no' : params[:mainspaceCount]} edit#{'s' if params[:mainspaceCount].to_i != 1} in the [[WP:MAINSPACE|mainspace]]"
       when :fetchdeclined
         "has had #{params[:numDeclined]} request#{'s' if params[:numDeclined].to_i > 1} for #{@permission.downcase} declined in the past #{@config["fetchdeclined_offset"]} days (#{params[:declinedLinks]})"
+      when :mainspaceCount
+        "has #{params[:mainspaceCount].to_i == 0 ? 'no' : params[:mainspaceCount]} edit#{'s' if params[:mainspaceCount].to_i != 1} in the [[WP:MAINSPACE|mainspace]]"
     end
   end
 

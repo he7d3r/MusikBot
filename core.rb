@@ -5,12 +5,15 @@ require 'auth.rb'
 require 'perm_clerk.rb'
 
 MediaWiki::Gateway.default_user_agent = 'MusikBot/1.1 (http://en.wikipedia.org/wiki/User:MusikBot/)'
-mw = MediaWiki::Gateway.new('http://en.wikipedia.org/w/api.php', ignorewarnings: true)
+mw = MediaWiki::Gateway.new('http://test.wikipedia.org/w/api.php', ignorewarnings: true)
 Auth.login(mw)
 
 pagesToFetch = [
   "User:MusikBot/PermClerk/Run",
-  # "User:MusikBot/PermClerk/Archive/Run",
+  "User:MusikBot/PermClerk/Archive/Run",
+  "User:MusikBot/PermClerk/Archive/Offset",
+  "User:MusikBot/PermClerk/Archive/Done",
+  "User:MusikBot/PermClerk/Archive/Notdone",
   "User:MusikBot/PermClerk/Autoformat/Run",
   "User:MusikBot/PermClerk/Autorespond/Run",
   "User:MusikBot/PermClerk/FetchDeclined/Run",
@@ -32,7 +35,7 @@ config = {}
 for configPage in configPages
   configName = configPage.attributes["title"].gsub(/User\:MusikBot\/PermClerk\/?/,"").gsub("/","_").downcase.chomp("_run").chomp(".js")
 
-  if configName == "fetchdeclined_offset"
+  if configName == "fetchdeclined_offset" || configName == "archive_offset"
     config[configName] = configPage.elements['revisions'][0][0].to_s.to_i
   elsif configName == "prerequisites_config"
     config[configName] = JSON.parse(CGI.unescapeHTML(configPage.elements['revisions'][0][0].to_s))
