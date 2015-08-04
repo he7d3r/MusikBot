@@ -2,12 +2,6 @@ module PermClerk
   require 'date'
   require 'logger'
 
-  @logger = Logger.new("perm_clerk.log")
-  @logger.level = Logger::DEBUG
-
-  @runStatus = eval(File.open("lastrun", "r").read) rescue {}
-  @runFile = File.open("lastrun", "r+")
-
   COMMENT_INDENT = "\n::"
   AWB_COMMENT_INDENT = "\n*:"
   COMMENT_PREFIX = "{{comment|Automated comment}} "
@@ -27,22 +21,26 @@ module PermClerk
     "AWB" => "awb"
   }
 
-  @userLinksCache = {}
-  @userInfoCache = {}
-  @deniedCache = {}
-
   def self.init(mw, replClient, config)
     @mw = mw
-    @config = config
     @replClient = replClient
+    @config = config
 
-    if config[:env] == :production
+    @deniedCache = {}
+    @userInfoCache = {}
+    @userLinksCache = {}
+
+    @logger = Logger.new("perm_clerk.log")
+    @logger.level = Logger::DEBUG
+
+    @runStatus = eval(File.open("lastrun", "r").read) rescue {}
+    @runFile = File.open("lastrun", "r+")
+
+    @archiveChanges = {}
+    @errors = {}
+
+    if @config[:env] == :production
       @PREREQ_EXPIRY = 90
-    else
-      @PREREQ_EXPIRY = 0
-    end
-
-    if config[:env] == :production
       @PERMISSIONS = [
         "Account creator",
         "Autopatrolled",
@@ -55,15 +53,17 @@ module PermClerk
         "Template editor"
       ]
     else
+      @PREREQ_EXPIRY = 0
       @PERMISSIONS = ["Rollback"]
     end
 
     start
+
+    @runFile.write(@runStatus.inspect)
+    @runFile.close
   end
 
   def self.start
-    @errors = {}
-    @archiveChanges = {}
     totalUserCount = 0
     for @permission in @PERMISSIONS
       sleep 2
@@ -85,18 +85,9 @@ module PermClerk
     @permission = ""
     archiveRequests if @archiveChanges.length
 
-    errorsDigest = Digest::MD5.hexdigest(@errors.values.join)
-    if totalUserCount > 0 && (@runStatus["report_errors"] != errorsDigest || parseDateTime(@runStatus["report"]) < currentTime - Rational(3, 24))
-      unless generateReport
-        @runStatus["report"] = currentTime.to_s
-        @runStatus["report_errors"] = errorsDigest
-      end
-    end
+    reportErrors(totalUserCount) if totalUserCount > 0
 
     info("#{'~' * 25} Task complete #{'~' * 25}")
-
-    @runFile.write(@runStatus.inspect)
-    @runFile.close
   end
 
   def self.process
@@ -174,7 +165,8 @@ module PermClerk
 
       userName.gsub!("_", " ")
 
-      timestamps = section.scan(/\d\d:\d\d.*\d{4} \(UTC\)/)
+      # XXX: shouldn't include MusikBot's timestamp now
+      timestamps = section.scan(/(?<!&lt;!-- mbdate --&gt; )\d\d:\d\d.*\d{4} \(UTC\)/)
       newestTimestamp = timestamps.min {|a,b| parseDateTime(b) <=> parseDateTime(a)}
       if overridenResolution = section.match(/\{\{User:MusikBot\/override\|d\}\}/i) ? "done" : section.match(/\{\{User:MusikBot\/override\|nd\}\}/i) ? "notdone" : false
         info("  Resolution override found")
@@ -204,12 +196,11 @@ module PermClerk
 
       # <ARCHIVING>
       if resolution && @config["archive"] && resolutionDate.nil?
-        error("    User:#{userName}: Resolution template not dated")
         @errors[@permission] = @errors[@permission].to_a << {
           group: "archive",
           message: "User:#{userName} - Resolution template not dated"
         }
-        next
+        error("    User:#{userName}: Resolution template not dated") and next
       elsif resolution && @config["archive"] && (shouldArchiveNow || parseDateTime(newestTimestamp) + Rational(@config["archive_offset"], 24) < currentTime)
         if shouldArchiveNow
           info("  Found request for immediate archiving")
@@ -232,12 +223,13 @@ module PermClerk
             newWikitext << @splitKey + section
             next
           elsif !hasPermission && @permission != "AWB"
-            error("    #{userName} does not have the permission #{@permission}")
             requestChanges << {
               type: :noSaidPermission,
               permission: @permission.downcase
             }
             @editSummaries << :noSaidPermission
+
+            newWikitext = queueChanges(requestChanges, section, botSection, newWikitext)
 
             @errors[@permission] = @errors[@permission].to_a << {
               group: "archive",
@@ -245,9 +237,7 @@ module PermClerk
                 "Use <code><nowiki>{{subst:User:MusikBot/override|d}}</nowiki></code> to archive as approved or " +
                 "<code><nowiki>{{subst:User:MusikBot/override|nd}}</nowiki></code> to archive as declined"
             }
-
-            newWikitext = queueChanges(requestChanges, section, botSection, newWikitext)
-            next
+            error("    #{userName} does not have the permission #{@permission}") and next
           end
         end
 
@@ -369,6 +359,20 @@ module PermClerk
 
               if pass.nil?
                 error("      failed to fetch prerequisite data: #{key}")
+                @errors[@permission] = @errors[@permission].to_a << {
+                  group: "prerequisites",
+                  message: "Failed to fetch data <tt>#{key}</t> for User:#{userName}"
+                }
+              elsif pass
+                info("      User meets criteria")
+                # if updatingPrereq
+                #   info("      Removing prereq comment")
+
+                #   # FIXME: either check if this prereq is part of a string of other prereqs and only remove that part,
+                #   #   or find a way to remove the comment altogether before looping through prereq array
+                #   section.gsub!(/\\n::{{comment\|Automated comment}}.*&lt;!-- mbdate --&gt; \d\d:\d\d, \d+ \w+ \d{4} \(UTC\)/, "")
+                #   shouldUpdatePrereqData = false
+                # end
               elsif updatingPrereq
                 prereqCountRegex = section.scan(/(&lt;!-- mb-#{key} --&gt;(.*)&lt;!-- mb-#{key}-end --&gt;)/)
                 prereqText = prereqCountRegex.flatten[0]
@@ -388,8 +392,6 @@ module PermClerk
                 info("      Found unmet prerequisite: #{key}")
                 requestChanges << { type: key }.merge(userInfo)
                 @editSummaries << :prerequisites
-              else
-                info("      User meets criteria")
               end
             end
           end
@@ -460,6 +462,10 @@ module PermClerk
 
       @archiveFetchThrotte = 0
       unless pageWikitext = fetchArchivePage(pageToEdit)
+        @errors["Fatal"] = @errors[@permission].to_a << {
+          group: "archive",
+          message: "Unable to fetch archive page for #{key}. Some requests may not have been saved to archives."
+        }
         error("  unable to fetch archive page for #{key}, aborting") and return false
       end
 
@@ -502,6 +508,10 @@ module PermClerk
 
         @archiveFetchThrotte = 0
         unless logPage = fetchArchivePage(logPageName)
+          @errors["Fatal"] = @errors[@permission].to_a << {
+            group: "archive",
+            message: "Unable to fetch log page [[#{logPageName}]], archiving aborted"
+          }
           error("  unable to fetch log page [[#{logPageName}]], aborting") and return false
         end
 
@@ -573,6 +583,16 @@ module PermClerk
     end
   end
 
+  def self.reportErrors
+    errorsDigest = Digest::MD5.hexdigest(@errors.values.join)
+    if @runStatus["report_errors"] != errorsDigest || parseDateTime(@runStatus["report"]) < currentTime - Rational(3, 24)
+      unless generateReport
+        @runStatus["report"] = currentTime.to_s
+        @runStatus["report_errors"] = errorsDigest
+      end
+    end
+  end
+
   def self.generateReport
     if @errors.keys.length > 0
       numErrors = @errors.values.flatten.length
@@ -596,7 +616,7 @@ module PermClerk
     end
   end
 
-  def self.editPermissionPage(newWikitext)
+  def self.editPermissionPage(newWikitext, e)
     adminBacklog = !!(newWikitext =~ /\{\{admin\s*backlog(?:\|bot=MusikBot)?\}\}/)
 
     fixes = []
@@ -665,12 +685,22 @@ module PermClerk
           return process(@permission)
         else
           warn("API error when writing to page: #{e.code.to_s}, trying again")
-          return process(@permission)
+          # FIXME: make sure recursively calling editPermissionPage(newWikitext) works!
+          return editPermissionPage(newWikitext, e)
         end
       rescue => e
+        @errors[@permission] = @errors[@permission].to_a << {
+          group: "Saving",
+          message: "Exception thrown when writing to page. Error: <tt>#{e.message}</tt>"
+        } if @errors[@permission]
         error("Unknown exception when writing to page: #{e.message}") and return false
       end
     else
+      @errors[@permission] = @errors[@permission].to_a << {
+        group: "Saving",
+        message: "Throtte hit for edit page operation. " +
+          lastError ? "Error: <tt>#{e.message}</tt>. " : ""
+      }
       error("Throttle hit for edit page operation, continuing to process next permission") and return false
     end
 
@@ -902,8 +932,21 @@ module PermClerk
         return setPageProps
       end
     else
+      @errors[@permission] = @errors[@permission].to_a << {
+        group: "Internal error",
+        message: "Unable to fetch page properties."
+      }
       error("Unable to fetch page properties, continuing to process next permission") and return false
     end
+  end
+
+  # FIXME: refactor and use this method
+  def self.recordError(group, message, logMessage, errorSet = @permission)
+    @errors[errorSet] = @errors[errorSet].to_a << {
+      group: group,
+      message: message
+    }
+    error(logMessage) and next
   end
 
   def self.debug(msg); @logger.debug("#{@permission.upcase} : #{msg}"); end
