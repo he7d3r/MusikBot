@@ -85,7 +85,7 @@ module PermClerk
     @permission = ""
     archiveRequests if @archiveChanges.length
 
-    reportErrors(totalUserCount) if totalUserCount > 0
+    reportErrors
 
     info("#{'~' * 25} Task complete #{'~' * 25}")
   end
@@ -196,11 +196,11 @@ module PermClerk
 
       # <ARCHIVING>
       if resolution && @config["archive"] && resolutionDate.nil?
-        @errors[@permission] = @errors[@permission].to_a << {
+        recordError({
           group: "archive",
-          message: "User:#{userName} - Resolution template not dated"
-        }
-        error("    User:#{userName}: Resolution template not dated") and next
+          message: "User:#{userName} - Resolution template not dated",
+          logMessage: "    User:#{userName}: Resolution template not dated"
+        }) and next
       elsif resolution && @config["archive"] && (shouldArchiveNow || parseDateTime(newestTimestamp) + Rational(@config["archive_offset"], 24) < currentTime)
         if shouldArchiveNow
           info("  Found request for immediate archiving")
@@ -231,13 +231,13 @@ module PermClerk
 
             newWikitext = queueChanges(requestChanges, section, botSection, newWikitext)
 
-            @errors[@permission] = @errors[@permission].to_a << {
+            recordError({
               group: "archive",
               message: "User:#{userName} does not have the permission #{@permission}. " +
                 "Use <code><nowiki>{{subst:User:MusikBot/override|d}}</nowiki></code> to archive as approved or " +
-                "<code><nowiki>{{subst:User:MusikBot/override|nd}}</nowiki></code> to archive as declined"
-            }
-            error("    #{userName} does not have the permission #{@permission}") and next
+                "<code><nowiki>{{subst:User:MusikBot/override|nd}}</nowiki></code> to archive as declined",
+              logMessage: "    #{userName} does not have the permission #{@permission}"
+            }) and next
           end
         end
 
@@ -358,11 +358,11 @@ module PermClerk
               # templateSpaceCount + moduleSpaceCount >= value
 
               if pass.nil?
-                error("      failed to fetch prerequisite data: #{key}")
-                @errors[@permission] = @errors[@permission].to_a << {
+                recordError({
                   group: "prerequisites",
-                  message: "Failed to fetch data <tt>#{key}</t> for User:#{userName}"
-                }
+                  message: "Failed to fetch data <tt>#{key}</t> for User:#{userName}",
+                  logMessage: "      failed to fetch prerequisite data: #{key}"
+                })
               elsif pass
                 info("      User meets criteria")
                 # if updatingPrereq
@@ -462,11 +462,12 @@ module PermClerk
 
       @archiveFetchThrotte = 0
       unless pageWikitext = fetchArchivePage(pageToEdit)
-        @errors["Fatal"] = @errors[@permission].to_a << {
+        recordError({
           group: "archive",
-          message: "Unable to fetch archive page for #{key}. Some requests may not have been saved to archives."
-        }
-        error("  unable to fetch archive page for #{key}, aborting") and return false
+          message: "Unable to fetch archive page for #{key}. Some requests may not have been saved to archives.",
+          logMessage: "  unable to fetch archive page for #{key}, aborting",
+          errorSet: "Fatal"
+        }) and return false
       end
 
       newPage = pageWikitext.empty?
@@ -508,11 +509,12 @@ module PermClerk
 
         @archiveFetchThrotte = 0
         unless logPage = fetchArchivePage(logPageName)
-          @errors["Fatal"] = @errors[@permission].to_a << {
+          recordError({
             group: "archive",
-            message: "Unable to fetch log page [[#{logPageName}]], archiving aborted"
-          }
-          error("  unable to fetch log page [[#{logPageName}]], aborting") and return false
+            message: "Unable to fetch log page [[#{logPageName}]], archiving aborted",
+            logMessage: "  unable to fetch log page [[#{logPageName}]], aborting",
+            errorSet: "Fatal"
+          }) and return false
         end
 
         # convert to {"year" => "requests"}
@@ -616,7 +618,7 @@ module PermClerk
     end
   end
 
-  def self.editPermissionPage(newWikitext, e)
+  def self.editPermissionPage(newWikitext, e = nil)
     adminBacklog = !!(newWikitext =~ /\{\{admin\s*backlog(?:\|bot=MusikBot)?\}\}/)
 
     fixes = []
@@ -685,23 +687,22 @@ module PermClerk
           return process(@permission)
         else
           warn("API error when writing to page: #{e.code.to_s}, trying again")
-          # FIXME: make sure recursively calling editPermissionPage(newWikitext) works!
           return editPermissionPage(newWikitext, e)
         end
       rescue => e
-        @errors[@permission] = @errors[@permission].to_a << {
+        recordError({
           group: "Saving",
-          message: "Exception thrown when writing to page. Error: <tt>#{e.message}</tt>"
-        } if @errors[@permission]
-        error("Unknown exception when writing to page: #{e.message}") and return false
+          message: "Exception thrown when writing to page. Error: <tt>#{e.message}</tt>",
+          logMessage: "Unknown exception when writing to page: #{e.message}"
+        }) and return false
       end
     else
-      @errors[@permission] = @errors[@permission].to_a << {
+      recordError({
         group: "Saving",
         message: "Throtte hit for edit page operation. " +
-          lastError ? "Error: <tt>#{e.message}</tt>. " : ""
-      }
-      error("Throttle hit for edit page operation, continuing to process next permission") and return false
+          lastError ? "Error: <tt>#{e.message}</tt>. " : "",
+        logMessage: "Throttle hit for edit page operation, continuing to process next permission"
+      }) and return false
     end
 
     true
@@ -932,21 +933,21 @@ module PermClerk
         return setPageProps
       end
     else
-      @errors[@permission] = @errors[@permission].to_a << {
+      recordError({
         group: "Internal error",
-        message: "Unable to fetch page properties."
-      }
-      error("Unable to fetch page properties, continuing to process next permission") and return false
+        message: "Unable to fetch page properties.",
+        logMessage: "Unable to fetch page properties, continuing to process next permission"
+      }) and return false
     end
   end
 
-  # FIXME: refactor and use this method
-  def self.recordError(group, message, logMessage, errorSet = @permission)
+  def self.recordError(opts)
+    errorSet = opts[:errorSet] || @permission
     @errors[errorSet] = @errors[errorSet].to_a << {
-      group: group,
-      message: message
+      group: opts[:group],
+      message: opts[:message]
     }
-    error(logMessage) and next
+    error(opts[:logMessage])
   end
 
   def self.debug(msg); @logger.debug("#{@permission.upcase} : #{msg}"); end
